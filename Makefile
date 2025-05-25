@@ -78,7 +78,7 @@ run: ### Running app
 .PHONY: run
 
 network-create:
-	@if docker network ls | grep "${APP_NETWORK}-network" >/dev/null 2>&1; then \
+	@if docker network ls | grep " ${APP_NETWORK}-network " >/dev/null 2>&1; then \
   		echo -e "${RED}${APP_NETWORK}-network already exists${RESET}"; \
   	else \
   	  	docker network create ${APP_NETWORK}-network >/dev/null 2>&1; \
