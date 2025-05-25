@@ -1,0 +1,50 @@
+services:
+  raspyxtn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: ${APP_NAME}
+    container_name: ${APP_NAME}
+    networks:
+      - raspyx_raspyx-network
+    env_file:
+      - .env
+    logging:
+      driver: "local"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    depends_on:
+      postgrestn:
+        condition: service_healthy
+    command: >
+      sh -c "make migrate-up; ./${APP_NAME}"
+    restart: always
+
+  postgrestn:
+    image: postgres:17-alpine
+    container_name: ${APP_NAME}db
+    restart: always
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${APP_NAME}db
+    command: postgres -p 5433
+    networks:
+      - raspyx_raspyx-network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sh:/docker-entrypoint-initdb.d/init_db.sh
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-p", "5433", "-U", "postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+
+networks:
+  raspyx_raspyx-network:
+    external: true
