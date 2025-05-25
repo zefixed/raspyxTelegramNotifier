@@ -1,0 +1,67 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'ENV_FILE_ID', defaultValue: '', description: 'id .env file in Jenkins credentials')
+    }
+
+    environment {
+        GOPATH = "/var/jenkins_home/go"
+        PATH = "${PATH}:/opt/go/bin:${GOPATH}/bin"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    if (!params.ENV_FILE_ID?.trim()) {
+                        error "ENV_FILE_ID is not set!"
+                    }
+
+                    withCredentials([file(credentialsId: "${params.ENV_FILE_ID}", variable: 'ENV_FILE')]) {
+                        sh('cp ${ENV_FILE} ${WORKSPACE}/.env')
+                    }
+                }
+            }
+        }
+
+        stage('Build with Docker') {
+            steps {
+                script {
+                    dir(WORKSPACE) {
+                        sh('docker-compose build --no-cache')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    dir(WORKSPACE) {
+                        sh """
+                        docker-compose down || true
+                        docker-compose up -d
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Clean') {
+            steps {
+                script {
+                    dir(WORKSPACE) {
+                        sh('docker system prune -a -f')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
