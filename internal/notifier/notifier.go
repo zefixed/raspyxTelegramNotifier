@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	kafkago "github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go"
 	"log/slog"
 	"raspyxTelegramNotifier/internal/dto"
-	"raspyxTelegramNotifier/internal/kafka"
+	mykafka "raspyxTelegramNotifier/internal/kafka"
 	"raspyxTelegramNotifier/internal/usecase"
 	"strconv"
 	"strings"
@@ -23,13 +23,13 @@ type Event struct {
 type Notifier struct {
 	log      *slog.Logger
 	userUC   *usecase.UserUseCase
-	consumer *kafka.Consumer
+	consumer *mykafka.Consumer
 	bot      *tgbotapi.BotAPI
 	token    string
 	debug    bool
 }
 
-func NewNotifier(log *slog.Logger, userUC *usecase.UserUseCase, consumer *kafka.Consumer, token string, debug bool) *Notifier {
+func NewNotifier(log *slog.Logger, userUC *usecase.UserUseCase, consumer *mykafka.Consumer, token string, debug bool) *Notifier {
 	return &Notifier{
 		log:      log,
 		userUC:   userUC,
@@ -40,19 +40,18 @@ func NewNotifier(log *slog.Logger, userUC *usecase.UserUseCase, consumer *kafka.
 }
 
 func (n *Notifier) Run(ctx context.Context) {
-	bot, err := tgbotapi.NewBotAPI(n.token)
+	const op = "notifier.notifier.Run"
+
+	// Setting up new bot
+	err := n.setupNewBot()
 	if err != nil {
-		n.log.Error("error creating bot API", slog.String("error", err.Error()))
-		return
+		n.log.Error(fmt.Sprintf("error creating new bot: %v", err))
 	}
 
-	if bot == nil {
-		n.log.Error("bot is nil")
-		return
-	}
-
-	n.bot = bot
+	// Setting debug var
 	n.bot.Debug = n.debug
+
+	// Defer stopping the go routine which receives updates
 	defer n.bot.StopReceivingUpdates()
 
 	n.log.Info(fmt.Sprintf("authorized on account %s", n.bot.Self.UserName))
@@ -61,8 +60,9 @@ func (n *Notifier) Run(ctx context.Context) {
 	u.Timeout = 60
 	updates := n.bot.GetUpdatesChan(u)
 
-	msgChan := make(chan kafkago.Message, 100)
+	msgChan := make(chan kafka.Message, 100)
 
+	// Start consuming messages
 	go func() {
 		defer close(msgChan)
 		err = n.consumer.Consume(ctx, msgChan)
@@ -85,13 +85,7 @@ func (n *Notifier) Run(ctx context.Context) {
 
 			// Message received
 			if update.Message != nil {
-				if update.Message.Command() == "start" {
-					n.commandStart(ctx, &update)
-				} else if update.Message.Command() == "delete" {
-					n.commandDelete(ctx, &update)
-				} else {
-					n.respondUnknownMessage(&update)
-				}
+				n.responseCommand(ctx, &update)
 			}
 		case msg, ok := <-msgChan:
 			if !ok {
@@ -102,13 +96,23 @@ func (n *Notifier) Run(ctx context.Context) {
 			var data Event
 			err = json.Unmarshal(msg.Value, &data)
 			if err != nil {
-				fmt.Println(err)
+				n.log.Error("error preparing message", slog.String("error", err.Error()))
 			}
 
 			n.log.Info("received kafka message", slog.Any("data", data))
 
-			n.mailing(ctx, string(msg.Value))
+			n.mailing(ctx, data)
 		}
+	}
+}
+
+func (n *Notifier) responseCommand(ctx context.Context, update *tgbotapi.Update) {
+	if update.Message.Command() == "start" {
+		n.commandStart(ctx, update)
+	} else if update.Message.Command() == "delete" {
+		n.commandDelete(ctx, update)
+	} else {
+		n.respondUnknownMessage(update)
 	}
 }
 
@@ -185,28 +189,13 @@ func (n *Notifier) commandDelete(ctx context.Context, update *tgbotapi.Update) {
 	))
 }
 
-func prepareMessage(text string) (string, error) {
-	var data Event
-	err := json.Unmarshal([]byte(text), &data)
-	if err != nil {
-		return "", fmt.Errorf(fmt.Sprintf("error preparing message: %v", err))
-	}
-
-	return fmt.Sprintf("<blockquote><b>🕛 Timestamp:</b> %v\n"+
-		"<b>🗨️ Message:</b> %v</blockquote>", data.Timestamp.Format("15:04:05.999 02.01.2006 MST"), data.Message), nil
-}
-
-func (n *Notifier) sendMessage(chatID int64, text string) {
-	text, err := prepareMessage(text)
-	if err != nil {
-		n.log.Error("error", slog.String("error", err.Error()))
-		return
-	}
+func (n *Notifier) sendMessage(chatID int64, data Event) {
+	text := prepareMessage(data)
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
 
-	_, err = n.bot.Send(msg)
+	_, err := n.bot.Send(msg)
 	if err != nil {
 		n.log.Error("error sending message", slog.String("error", err.Error()))
 		return
@@ -218,7 +207,7 @@ func (n *Notifier) sendMessage(chatID int64, text string) {
 	}))
 }
 
-func (n *Notifier) mailing(ctx context.Context, text string) {
+func (n *Notifier) mailing(ctx context.Context, data Event) {
 	users, err := n.userUC.Get(ctx)
 	if err != nil {
 		n.log.Error("error sending messages", slog.String("error", err.Error()))
@@ -230,7 +219,26 @@ func (n *Notifier) mailing(ctx context.Context, text string) {
 		case <-ctx.Done():
 			return
 		default:
-			n.sendMessage(user.TelegramID, text)
+			n.sendMessage(user.TelegramID, data)
 		}
 	}
+}
+
+func (n *Notifier) setupNewBot() error {
+	bot, err := tgbotapi.NewBotAPI(n.token)
+	if err != nil {
+		return fmt.Errorf("error creating bot API: %v", err.Error())
+	}
+
+	if bot == nil {
+		return fmt.Errorf("bot is nil")
+	}
+
+	n.bot = bot
+	return nil
+}
+
+func prepareMessage(data Event) string {
+	return fmt.Sprintf("<blockquote><b>🕛 Timestamp:</b> %v\n"+
+		"<b>🗨️ Message:</b> %v</blockquote>", data.Timestamp.Format("15:04:05.999 02.01.2006 MST"), data.Message)
 }
